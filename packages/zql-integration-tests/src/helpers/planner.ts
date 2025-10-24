@@ -3,12 +3,14 @@ import type {NameMapper} from '../../../zero-types/src/name-mapper.ts';
 import {planQuery} from '../../../zql/src/planner/planner-builder.ts';
 import type {ConnectionCostModel} from '../../../zql/src/planner/planner-connection.ts';
 import type {AnyQuery} from '../../../zql/src/query/query-impl.ts';
+import type {PlanDebugger} from '../../../zql/src/planner/planner-debug.ts';
 
 export function makeGetPlanAST(
   mapper: NameMapper,
   costModel: ConnectionCostModel,
 ) {
-  return (q: AnyQuery) => planQuery(mapAST(q.ast, mapper), costModel);
+  return (q: AnyQuery, planDebugger?: PlanDebugger) =>
+    planQuery(mapAST(q.ast, mapper), costModel, planDebugger);
 }
 
 // oxlint-disable-next-line no-explicit-any
