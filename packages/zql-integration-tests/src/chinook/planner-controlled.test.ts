@@ -46,10 +46,7 @@ describe('two joins via and', () => {
       costModel,
     );
 
-    // Genre gets flipped to the root
-    // Cost 10 -> Cost 1 -> Cost 1
-    // TODO: we need some tracing mechanism to check what constraints were chosen
-    expect(pick(planned, ['where', 'conditions', 0, 'flip'])).toBe(false);
+    expect(pick(planned, ['where', 'conditions', 0, 'flip'])).toBe(true);
     expect(pick(planned, ['where', 'conditions', 1, 'flip'])).toBe(true);
     expect(
       pick(planned, ['where', 'conditions', 1, 'related', 'subquery', 'table']),
@@ -329,7 +326,6 @@ test('ors anded one after the other', () => {
       or(exists('invoiceLines'), exists('mediaType')),
     ).ast;
 
-  // All tables have similar cost, so no flips should occur
   const costModel = makeCostModel({
     track: 10000,
     album: 10000,
@@ -348,10 +344,12 @@ test('ors anded one after the other', () => {
   expect(
     pick(planned, ['where', 'conditions', 0, 'conditions', 1, 'flip']),
   ).toBe(false);
+
   // Check second OR: invoiceLines and mediaType
+  // flipping invoice lines is actually cheaper due to the FK from invoiceLine -> track
   expect(
     pick(planned, ['where', 'conditions', 1, 'conditions', 0, 'flip']),
-  ).toBe(false);
+  ).toBe(true);
   expect(
     pick(planned, ['where', 'conditions', 1, 'conditions', 1, 'flip']),
   ).toBe(false);
