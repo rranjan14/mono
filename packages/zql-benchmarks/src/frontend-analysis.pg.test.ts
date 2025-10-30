@@ -88,9 +88,7 @@ const maintain100PointQueries = new B(
   'maintain 100 point queries',
   function* () {
     const views = Array.from({length: 100}, (_, i) =>
-      harness.delegates.memory.materialize(
-        harness.queries.memory.track.where('id', i + 1),
-      ),
+      harness.queries.memory.track.where('id', i + 1).materialize(),
     );
     let count = 0;
     yield () => {
@@ -264,7 +262,7 @@ const maintain10RangeQueriesAltField = new B(
       zql.invoiceLine.orderBy('unitPrice', 'desc').limit(10),
       zql.customer.orderBy('lastName', 'asc').limit(10),
       zql.employee.orderBy('lastName', 'asc').limit(10),
-    ].map(q => harness.delegates.memory.materialize(q));
+    ].map(q => q.materialize());
     let count = 0;
     yield () => {
       const table = tables[count % tables.length];

@@ -6,10 +6,9 @@ import {
   syncedQueryWithContext,
   withValidation,
 } from './named.ts';
-import {queryWithContext} from './query-internals.ts';
-import type {QueryResultType, QueryReturn, QueryRowType, Row} from './query.ts';
+import {ast} from './query-impl.ts';
+import type {QueryResultType, QueryRowType, Row} from './query.ts';
 import {schema} from './test/test-schemas.ts';
-
 const builder = createBuilder(schema);
 
 type IssueRow = {
@@ -97,17 +96,20 @@ test('syncedQuery', () => {
     }[]
   >();
 
-  const query = def('123');
-  expectTypeOf<QueryReturn<typeof query>>().toEqualTypeOf<{
-    readonly id: string;
-    readonly title: string;
-    readonly description: string;
-    readonly closed: boolean;
-    readonly ownerId: string | null;
-    readonly createdAt: number;
-  }>();
+  const q = def('123');
+  expectTypeOf<ReturnType<typeof q.run>>().toEqualTypeOf<
+    Promise<
+      {
+        readonly id: string;
+        readonly title: string;
+        readonly description: string;
+        readonly closed: boolean;
+        readonly ownerId: string | null;
+        readonly createdAt: number;
+      }[]
+    >
+  >();
 
-  const q = queryWithContext(query, undefined);
   expect(q.customQueryID).toEqual({
     name: 'myQuery',
     args: ['123'],
@@ -134,7 +136,6 @@ test('syncedQuery', () => {
   expect(wv.queryName).toEqual('myQuery');
   expect(wv.parse).toBeDefined();
   expect(wv.takesContext).toEqual(true);
-  // @ts-expect-error 123 is not a string
   expect(() => wv('ignored', 123)).toThrow(
     'invalid_type at .0 (expected string)',
   );
@@ -159,17 +160,20 @@ test('syncedQuery', () => {
     }[]
   >();
 
-  const vquery = wv('ignored', '123');
-  expectTypeOf<QueryReturn<typeof vquery>>().toEqualTypeOf<{
-    readonly id: string;
-    readonly title: string;
-    readonly description: string;
-    readonly closed: boolean;
-    readonly ownerId: string | null;
-    readonly createdAt: number;
-  }>();
+  const vq = wv('ignored', '123');
+  expectTypeOf<ReturnType<typeof vq.run>>().toEqualTypeOf<
+    Promise<
+      {
+        readonly id: string;
+        readonly title: string;
+        readonly description: string;
+        readonly closed: boolean;
+        readonly ownerId: string | null;
+        readonly createdAt: number;
+      }[]
+    >
+  >();
 
-  const vq = queryWithContext(vquery, undefined);
   expect(vq.customQueryID).toEqual({
     name: 'myQuery',
     args: ['123'],
@@ -225,17 +229,20 @@ test('syncedQueryWithContext', () => {
     }[]
   >();
 
-  const query2 = def('user1', '123');
-  expectTypeOf<QueryReturn<typeof query2>>().toEqualTypeOf<{
-    readonly id: string;
-    readonly title: string;
-    readonly description: string;
-    readonly closed: boolean;
-    readonly ownerId: string | null;
-    readonly createdAt: number;
-  }>();
+  const q = def('user1', '123');
+  expectTypeOf<ReturnType<typeof q.run>>().toEqualTypeOf<
+    Promise<
+      {
+        readonly id: string;
+        readonly title: string;
+        readonly description: string;
+        readonly closed: boolean;
+        readonly ownerId: string | null;
+        readonly createdAt: number;
+      }[]
+    >
+  >();
 
-  const q = queryWithContext(query2, undefined);
   expect(q.customQueryID).toEqual({
     name: 'myQuery',
     args: ['123'],
@@ -279,7 +286,6 @@ test('syncedQueryWithContext', () => {
   expect(wv.queryName).toEqual('myQuery');
   expect(wv.parse).toBeDefined();
   expect(wv.takesContext).toEqual(true);
-  // @ts-expect-error 123 is not a string
   expect(() => wv('ignored', 123)).toThrow(
     'invalid_type at .0 (expected string)',
   );
@@ -304,17 +310,20 @@ test('syncedQueryWithContext', () => {
     }[]
   >();
 
-  const vquery2 = wv('user1', '123');
-  expectTypeOf<QueryReturn<typeof vquery2>>().toEqualTypeOf<{
-    readonly id: string;
-    readonly title: string;
-    readonly description: string;
-    readonly closed: boolean;
-    readonly ownerId: string | null;
-    readonly createdAt: number;
-  }>();
+  const vq = wv('user1', '123');
+  expectTypeOf<ReturnType<typeof vq.run>>().toEqualTypeOf<
+    Promise<
+      {
+        readonly id: string;
+        readonly title: string;
+        readonly description: string;
+        readonly closed: boolean;
+        readonly ownerId: string | null;
+        readonly createdAt: number;
+      }[]
+    >
+  >();
 
-  const vq = queryWithContext(vquery2, undefined);
   expect(vq.customQueryID).toEqual({
     name: 'myQuery',
     args: ['123'],
@@ -359,21 +368,9 @@ test('syncedQueryWithContext', () => {
 
 test('makeSchemaQuery', () => {
   const builders = createBuilder(schema);
-  const q1 = queryWithContext(
-    queryWithContext(builders.issue.where('id', '123'), undefined).nameAndArgs(
-      'myName',
-      ['123'],
-    ),
-    undefined,
-  );
-  expect(q1.ast).toMatchInlineSnapshot(`
+  const q1 = builders.issue.where('id', '123').nameAndArgs('myName', ['123']);
+  expect(ast(q1)).toMatchInlineSnapshot(`
     {
-      "orderBy": [
-        [
-          "id",
-          "asc",
-        ],
-      ],
       "table": "issue",
       "where": {
         "left": {

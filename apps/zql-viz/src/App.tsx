@@ -1,6 +1,5 @@
 /* oxlint-disable no-console */
 /* oxlint-disable @typescript-eslint/no-explicit-any */
-
 import {useCallback, useEffect, useState} from 'react';
 import {Panel, PanelGroup, PanelResizeHandle} from 'react-resizable-panels';
 import * as ts from 'typescript';
@@ -20,6 +19,7 @@ import {
 import * as zero from '../../../packages/zero-client/src/mod.ts';
 import {mapAST} from '../../../packages/zero-protocol/src/ast.ts';
 import {clientToServer} from '../../../packages/zero-schema/src/name-mapper.ts';
+import {delegateSymbol} from '../../../packages/zql/src/query/query.ts';
 import {VizDelegate} from './query-delegate.ts';
 
 type AnyQuery = zero.Query<any, any, any>;
@@ -207,7 +207,8 @@ function App() {
         throw new Error('Failed to capture the query definition');
       }
       const vizDelegate = new VizDelegate(capturedSchema);
-      await vizDelegate.run(capturedQuery);
+      capturedQuery = capturedQuery[delegateSymbol](vizDelegate);
+      (await capturedQuery.run()) as any;
       const graph = vizDelegate.getGraph();
       const mapper = clientToServer(capturedSchema.tables);
 
@@ -223,7 +224,7 @@ function App() {
               'Authorization': `Basic ${credentials}`,
             },
             body: JSON.stringify({
-              ast: mapAST(vizDelegate.withContext(capturedQuery).ast, mapper),
+              ast: mapAST(capturedQuery.ast, mapper),
             }),
           });
 
@@ -239,9 +240,7 @@ function App() {
       }
 
       setResult({
-        ast: capturedQuery
-          ? vizDelegate.withContext(capturedQuery).ast
-          : undefined,
+        ast: capturedQuery?.ast,
         graph,
         remoteRunResult,
       });

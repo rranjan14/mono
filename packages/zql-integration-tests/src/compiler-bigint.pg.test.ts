@@ -20,8 +20,7 @@ import {clientToServer} from '../../zero-schema/src/name-mapper.ts';
 import type {ServerSchema} from '../../zero-schema/src/server-schema.ts';
 import {getServerSchema} from '../../zero-server/src/schema.ts';
 import {Transaction} from '../../zero-server/src/test/util.ts';
-import type {QueryDelegate} from '../../zql/src/query/query-delegate.ts';
-import {newQuery} from '../../zql/src/query/query-impl.ts';
+import {completedAST, newQuery} from '../../zql/src/query/query-impl.ts';
 import {type Query} from '../../zql/src/query/query.ts';
 import {Database} from '../../zqlite/src/db.ts';
 import {fromSQLiteTypes} from '../../zqlite/src/table-source.ts';
@@ -83,7 +82,6 @@ type Schema = typeof schema;
 
 let issueQuery: Query<Schema, 'issue'>;
 let serverSchema: ServerSchema;
-let queryDelegate: QueryDelegate<unknown>;
 
 beforeAll(async () => {
   pg = await testDBs.create(DB_NAME, undefined, false);
@@ -129,9 +127,9 @@ beforeAll(async () => {
     {tableCopyWorkers: 1},
   );
 
-  queryDelegate = newQueryDelegate(lc, testLogConfig, sqlite, schema);
+  const queryDelegate = newQueryDelegate(lc, testLogConfig, sqlite, schema);
 
-  issueQuery = newQuery(schema, 'issue');
+  issueQuery = newQuery(queryDelegate, schema, 'issue');
 
   // Check that PG, SQLite, and test data are in sync
   const [issuePgRows, commentPgRows] = await Promise.all([
@@ -212,17 +210,13 @@ describe('compiling ZQL to SQL', () => {
   ) {
     test('All bigints in safe Number range', async () => {
       const query = issueQuery.related('comments').limit(2);
-      const c = compile(
-        serverSchema,
-        schema,
-        queryDelegate.withContext(query).ast,
-      );
+      const c = compile(serverSchema, schema, completedAST(query));
       const sqlQuery = formatPgInternalConvert(c);
       const pgResult = extractZqlResult(
         await runPgQuery(sqlQuery.text, sqlQuery.values as JSONValue[]),
       );
       const zqlResult = mapResultToClientNames(
-        await queryDelegate.run(query),
+        await query.run(),
         schema,
         'issue',
       );
@@ -267,11 +261,7 @@ describe('compiling ZQL to SQL', () => {
 
     test('bigint exceeds safe range', async () => {
       const query = issueQuery.related('comments');
-      const c = compile(
-        serverSchema,
-        schema,
-        queryDelegate.withContext(query).ast,
-      );
+      const c = compile(serverSchema, schema, completedAST(query));
       const sqlQuery = formatPgInternalConvert(c);
       const result = await runPgQuery(
         sqlQuery.text,
@@ -289,17 +279,13 @@ describe('compiling ZQL to SQL', () => {
           .where('hash', '<', Number(Number.MAX_SAFE_INTEGER))
           .where('hash', '!=', Number(Number.MAX_SAFE_INTEGER - 3)),
       );
-      const c = compile(
-        serverSchema,
-        schema,
-        queryDelegate.withContext(query).ast,
-      );
+      const c = compile(serverSchema, schema, completedAST(query));
       const sqlQuery = formatPgInternalConvert(c);
       const pgResult = extractZqlResult(
         await runPgQuery(sqlQuery.text, sqlQuery.values as JSONValue[]),
       );
       const zqlResult = mapResultToClientNames(
-        await queryDelegate.run(query),
+        await query.run(),
         schema,
         'issue',
       );
@@ -344,17 +330,13 @@ describe('compiling ZQL to SQL', () => {
       const q2 = issueQuery.related('comments', q =>
         q.where('hash', '=', Number.MAX_SAFE_INTEGER - 3),
       );
-      const c2 = compile(
-        serverSchema,
-        schema,
-        queryDelegate.withContext(q2).ast,
-      );
+      const c2 = compile(serverSchema, schema, completedAST(q2));
       const sqlQuery2 = formatPgInternalConvert(c2);
       const pgResult2 = extractZqlResult(
         await runPgQuery(sqlQuery2.text, sqlQuery2.values as JSONValue[]),
       );
       const zqlResult2 = mapResultToClientNames(
-        await queryDelegate.run(q2),
+        await q2.run(),
         schema,
         'issue',
       );

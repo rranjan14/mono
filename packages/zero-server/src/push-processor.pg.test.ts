@@ -21,16 +21,12 @@ const params = {
   appID: 'zero',
 };
 beforeEach(async () => {
-  pg = await testDBs.create('push-processor-test');
+  pg = await testDBs.create('zero-pg-web');
   await pg.unsafe(`
     CREATE SCHEMA IF NOT EXISTS zero_0;
     ${getClientsTableDefinition('zero_0')}
     ${getMutationsTableDefinition('zero_0')}
   `);
-
-  return async () => {
-    await testDBs.drop(pg);
-  };
 });
 
 function makePush(

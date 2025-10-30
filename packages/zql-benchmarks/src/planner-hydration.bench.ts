@@ -1,23 +1,22 @@
 import {bench, run, summary} from 'mitata';
-import {expect, test} from 'vitest';
-import {createSilentLogContext} from '../../shared/src/logging-test-utils.ts';
-import {computeZqlSpecs} from '../../zero-cache/src/db/lite-tables.ts';
-import type {LiteAndZqlSpec} from '../../zero-cache/src/db/specs.ts';
-import type {AST} from '../../zero-protocol/src/ast.ts';
-import {mapAST} from '../../zero-protocol/src/ast.ts';
+import {bootstrap} from '../../zql-integration-tests/src/helpers/runner.ts';
+import {getChinook} from '../../zql-integration-tests/src/chinook/get-deps.ts';
+import {schema} from '../../zql-integration-tests/src/chinook/schema.ts';
+import {createSQLiteCostModel} from '../../zqlite/src/sqlite-cost-model.ts';
 import {
   clientToServer,
   serverToClient,
 } from '../../zero-schema/src/name-mapper.ts';
-import {getChinook} from '../../zql-integration-tests/src/chinook/get-deps.ts';
-import {schema} from '../../zql-integration-tests/src/chinook/schema.ts';
-import {bootstrap} from '../../zql-integration-tests/src/helpers/runner.ts';
-import {defaultFormat} from '../../zql/src/ivm/default-format.ts';
 import {planQuery} from '../../zql/src/planner/planner-builder.ts';
+import {mapAST} from '../../zero-protocol/src/ast.ts';
+import type {AST} from '../../zero-protocol/src/ast.ts';
 import {QueryImpl} from '../../zql/src/query/query-impl.ts';
-import {queryWithContext} from '../../zql/src/query/query-internals.ts';
-import type {PullRow, Query} from '../../zql/src/query/query.ts';
-import {createSQLiteCostModel} from '../../zqlite/src/sqlite-cost-model.ts';
+import {defaultFormat} from '../../zql/src/ivm/default-format.ts';
+import type {Query} from '../../zql/src/query/query.ts';
+import {expect, test} from 'vitest';
+import {computeZqlSpecs} from '../../zero-cache/src/db/lite-tables.ts';
+import {createSilentLogContext} from '../../shared/src/logging-test-utils.ts';
+import type {LiteAndZqlSpec} from '../../zero-cache/src/db/specs.ts';
 
 const pgContent = await getChinook();
 
@@ -42,25 +41,26 @@ const clientToServerMapper = clientToServer(schema.tables);
 const serverToClientMapper = serverToClient(schema.tables);
 
 // Helper to create a query from an AST
-function createQuery<TTable extends keyof typeof schema.tables>(
+function createQuery<TTable extends keyof typeof schema.tables & string>(
   tableName: TTable,
   queryAST: AST,
 ) {
-  const q = new QueryImpl(schema, tableName, queryAST, defaultFormat, 'test');
-  return q as Query<
-    typeof schema,
-    TTable,
-    PullRow<TTable, typeof schema>,
-    unknown
-  >;
+  return new QueryImpl(
+    delegates.sqlite,
+    schema,
+    tableName,
+    queryAST,
+    defaultFormat,
+    'test',
+  );
 }
 
 // Helper to benchmark planned vs unplanned
-function benchmarkQuery<TTable extends keyof typeof schema.tables>(
+function benchmarkQuery<TTable extends keyof typeof schema.tables & string>(
   name: string,
   query: Query<typeof schema, TTable>,
 ) {
-  const unplannedAST = queryWithContext(query, undefined).ast;
+  const unplannedAST = query.ast;
 
   // Map to server names, plan, then map back to client names
   const mappedAST = mapAST(unplannedAST, clientToServerMapper);
@@ -68,18 +68,17 @@ function benchmarkQuery<TTable extends keyof typeof schema.tables>(
   const plannedServerAST = planQuery(mappedAST, costModel);
   const plannedClientAST = mapAST(plannedServerAST, serverToClientMapper);
 
-  const delegate = delegates.sqlite;
   const tableName = unplannedAST.table as TTable;
   const unplannedQuery = createQuery(tableName, unplannedAST);
   const plannedQuery = createQuery(tableName, plannedClientAST);
 
   summary(() => {
     bench(`unplanned: ${name}`, async () => {
-      await delegate.run(unplannedQuery);
+      await unplannedQuery.run();
     });
 
     bench(`planned: ${name}`, async () => {
-      await delegate.run(plannedQuery);
+      await plannedQuery.run();
     });
   });
 }

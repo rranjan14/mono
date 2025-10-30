@@ -1,6 +1,6 @@
 import {en, Faker, generateMersenne53Randomizer} from '@faker-js/faker';
 import {expect, test} from 'vitest';
-import {queryWithContext} from '../query-internals.ts';
+import type {StaticQuery} from '../static-query.ts';
 import {generateQuery} from './query-gen.ts';
 import {generateSchema} from './schema-gen.ts';
 
@@ -26,9 +26,10 @@ test('stable generation', () => {
     randomizer,
   });
   const schema = generateSchema(rng, faker);
-  const q = generateQuery(schema, {}, rng, faker);
 
-  expect(queryWithContext(q, undefined).ast).toMatchInlineSnapshot(`
+  const q = generateQuery(schema, {}, rng, faker);
+  // oxlint-disable-next-line @typescript-eslint/no-explicit-any
+  expect((q as StaticQuery<any, any>).ast).toMatchInlineSnapshot(`
     {
       "limit": 126,
       "orderBy": [
