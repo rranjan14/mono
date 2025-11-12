@@ -23,6 +23,8 @@ import {PipelineDriver} from './pipeline-driver.ts';
 import {ResetPipelinesSignal, Snapshotter} from './snapshotter.ts';
 import {TimeSliceTimer} from './view-syncer.ts';
 
+const NO_TIME_ADVANCEMENT_TIMER = {totalElapsed: () => 0};
+
 describe('view-syncer/pipeline-driver', () => {
   let dbFile: DbFile;
   let db: DB;
@@ -320,8 +322,10 @@ describe('view-syncer/pipeline-driver', () => {
     return new TimeSliceTimer().startWithoutYielding();
   }
 
-  function changes() {
-    return [...pipelines.advance(startTimer()).changes];
+  function changes(
+    timer: {totalElapsed: () => number} = NO_TIME_ADVANCEMENT_TIMER,
+  ) {
+    return [...pipelines.advance(timer).changes];
   }
 
   test('replica version', () => {
@@ -658,22 +662,19 @@ describe('view-syncer/pipeline-driver', () => {
     pipelines.init(null);
     [
       ...pipelines.addQuery('hash1', 'queryID1', ISSUES_AND_COMMENTS, {
+        // hydration time
         totalElapsed: () => 10,
       }),
     ];
 
-    replicator.processTransaction(
-      '134',
-      // Timeout only kicks in at 20 changes.
-      ...Array.from({length: 20}, (_, i) =>
-        messages.insert('issues', {id: String(30 + i)}),
-      ),
-    );
+    replicator.processTransaction('134', messages.insert('issues', {id: 'i1'}));
 
     // 6ms is larger than half of the hydration time.
     expect(() => [
       ...pipelines.advance({totalElapsed: () => 6}).changes,
-    ]).toThrow(ResetPipelinesSignal);
+    ]).toThrowErrorMatchingInlineSnapshot(
+      `[ResetPipelinesSignal: Advancement exceeded timeout at 0 of 1 changes after 6 ms. Advancement time limited base on total hydration time of 10 ms.]`,
+    );
   });
 
   test('reset', () => {
