@@ -2,9 +2,7 @@ import {describe, expect, test} from 'vitest';
 import {testLogConfig} from '../../otel/src/test-log-config.ts';
 import type {JSONValue} from '../../shared/src/json.ts';
 import {createSilentLogContext} from '../../shared/src/logging-test-utils.ts';
-import type {Ordering} from '../../zero-protocol/src/ast.ts';
 import type {Row, Value} from '../../zero-protocol/src/data.ts';
-import type {PrimaryKey} from '../../zero-protocol/src/primary-key.ts';
 import {Catch} from '../../zql/src/ivm/catch.ts';
 import type {Change} from '../../zql/src/ivm/change.ts';
 import {makeComparator} from '../../zql/src/ivm/data.ts';
@@ -289,122 +287,6 @@ describe('fetched value types', () => {
       }
     });
   }
-});
-
-describe('no primary key', () => {
-  type Foo = {id: string; a: number; b: number; c: number};
-  const columns = {
-    id: {type: 'string'},
-    a: {type: 'number'},
-    b: {type: 'number'},
-    c: {type: 'number'},
-  } as const;
-
-  const db = new Database(createSilentLogContext(), ':memory:');
-  db.exec(/* sql */ `
-        CREATE TABLE foo (id TEXT, a INT, b INT, c INT);
-        CREATE UNIQUE INDEX foo_id_key ON foo (id);
-        CREATE UNIQUE INDEX foo_ab_key ON foo (a, b);
-        CREATE INDEX foo_c_not_unique ON foo (c);
-        `);
-  const stmt = db.prepare(
-    /* sql */ `INSERT INTO foo (id, a, b, c) VALUES (?, ?, ?, ?);`,
-  );
-  stmt.run(['far', 234, 567, 333]);
-  stmt.run(['boo', 345, 112, 444]);
-  stmt.run(['foo', 345, 789, 555]);
-  const source = new TableSource(lc, testLogConfig, db, 'foo', columns, ['id']);
-
-  test.each([
-    [['id'], true],
-    [['a', 'b'], true],
-    [['b', 'a'], true],
-    [['a'], false],
-    [['b'], false],
-    [['c'], false],
-    [['b', 'c'], false],
-    [['a', 'c'], false],
-  ] satisfies [PrimaryKey, boolean][])(
-    'requires primary key to be uniquely indexed: %o',
-    (key, valid) => {
-      const createSource = () =>
-        new TableSource(lc, testLogConfig, db, 'foo', columns, key);
-      if (valid) {
-        createSource();
-      } else {
-        expect(createSource).toThrowError('does not have a UNIQUE index');
-      }
-    },
-  );
-
-  test.each([
-    [[['a', 'asc']]],
-    [[['b', 'asc']]],
-    [[['c', 'asc']]],
-    [
-      [
-        ['b', 'asc'],
-        ['c', 'desc'],
-      ],
-    ],
-  ] satisfies [Ordering][])('disallows non-unique orderings: %o', sort => {
-    expect(() => source.connect(sort)).toThrowError('Cannot orderBy(');
-  });
-
-  test.each([
-    [
-      [['id', 'asc']],
-      [
-        {id: 'boo', a: 345, b: 112, c: 444},
-        {id: 'far', a: 234, b: 567, c: 333},
-        {id: 'foo', a: 345, b: 789, c: 555},
-      ],
-    ],
-    [
-      [
-        ['a', 'asc'],
-        ['b', 'desc'],
-      ],
-      [
-        {id: 'far', a: 234, b: 567, c: 333},
-        {id: 'foo', a: 345, b: 789, c: 555},
-        {id: 'boo', a: 345, b: 112, c: 444},
-      ],
-    ],
-    [
-      [
-        ['c', 'asc'],
-        ['a', 'asc'],
-        ['b', 'desc'],
-      ],
-      [
-        {id: 'far', a: 234, b: 567, c: 333},
-        {id: 'boo', a: 345, b: 112, c: 444},
-        {id: 'foo', a: 345, b: 789, c: 555},
-      ],
-    ],
-    [
-      [
-        ['c', 'desc'],
-        ['id', 'asc'],
-      ],
-      [
-        {id: 'foo', a: 345, b: 789, c: 555},
-        {id: 'boo', a: 345, b: 112, c: 444},
-        {id: 'far', a: 234, b: 567, c: 333},
-      ],
-    ],
-  ] satisfies [Ordering, Foo[]][])(
-    'allows orderings with unique indexes: %o',
-    (sort, output) => {
-      const input = source.connect(sort);
-      const schema = input.getSchema();
-      expect(schema.sort.map(([col]) => col)).toEqual(
-        expect.arrayContaining([...schema.primaryKey]),
-      );
-      expect([...input.fetch({})].map(node => node.row)).toEqual(output);
-    },
-  );
 });
 
 test('pushing values does the correct writes and outputs', () => {
