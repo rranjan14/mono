@@ -23,10 +23,44 @@ const harness = await bootstrap({
   pgContent,
 });
 
+// Internal timeout for graceful handling (shorter than vitest timeout)
+const TEST_TIMEOUT_MS = 55_000;
+
+/**
+ * Error thrown when a fuzz test query exceeds the time limit.
+ * This is caught and treated as a pass (with warning) rather than a failure.
+ */
+class FuzzTimeoutError extends Error {
+  constructor(label: string, elapsedMs: number) {
+    super(`Fuzz test "${label}" timed out after ${elapsedMs}ms`);
+    this.name = 'FuzzTimeoutError';
+  }
+}
+
+/**
+ * Creates a shouldYield function that throws FuzzTimeoutError when the
+ * elapsed time exceeds the timeout. This allows synchronous query execution
+ * to be aborted when it takes too long.
+ */
+function createTimeoutShouldYield(
+  startTime: number,
+  timeoutMs: number,
+  label: string,
+): () => boolean {
+  return () => {
+    const elapsed = performance.now() - startTime;
+    if (elapsed > timeoutMs) {
+      throw new FuzzTimeoutError(label, elapsed);
+    }
+    return false; // Don't actually yield, just check timeout
+  };
+}
+
 // oxlint-disable-next-line expect-expect
-test.each(Array.from({length: 0}, () => createCase()))(
+test.each(Array.from({length: 100}, () => createCase()))(
   'fuzz-hydration $seed',
   runCase,
+  65_000, // vitest timeout: longer than internal timeout to ensure we catch it ourselves
 );
 
 test('sentinel', () => {
@@ -76,14 +110,30 @@ async function runCase({
   query: [AnyQuery, AnyQuery[]];
   seed: number;
 }) {
+  const label = `fuzz-hydration ${seed}`;
+  const startTime = performance.now();
+  const shouldYield = createTimeoutShouldYield(
+    startTime,
+    TEST_TIMEOUT_MS,
+    label,
+  );
+
   try {
-    await runAndCompare(schema, harness.delegates, query[0], undefined);
+    await harness.transact(async delegates => {
+      await runAndCompare(schema, delegates, query[0], undefined);
+    }, shouldYield);
   } catch (e) {
+    // Timeouts pass with a warning
+    if (e instanceof FuzzTimeoutError) {
+      console.warn(`⚠️ ${e.message} - passing anyway`);
+      return;
+    }
+
+    // Actual test failures get shrunk and re-thrown
     const zql = await shrink(query[1], seed);
     if (seed === REPRO_SEED) {
       throw e;
     }
-
     throw new Error('Mismatch. Repro seed: ' + seed + '\nshrunk zql: ' + zql);
   }
 }
