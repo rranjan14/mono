@@ -984,7 +984,14 @@ describe('change-streamer/storer', () => {
       // Prevent the beforeEach cleanup from re-throwing the rejected done.
       done = Promise.resolve();
 
-      // subscribers that were waiting to be caught up should be canceled
+      // Subscribers that were waiting to be caught up are canceled without a
+      // downstream error, so they reconnect rather than restoring a replica.
+      // An ownership handoff is a routine event; it must not fan out into a
+      // fleet-wide litestream restore.
+      for (const stream of [stream1, stream2]) {
+        const iterator = stream[Symbol.asyncIterator]();
+        expect((await iterator.next()).done).toBe(true);
+      }
       expect(stream1.active).toBe(false);
       expect(stream2.active).toBe(false);
     });

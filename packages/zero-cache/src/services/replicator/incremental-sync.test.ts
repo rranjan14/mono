@@ -17,6 +17,7 @@ import type {Enum} from '../../../../shared/src/enum.ts';
 import {createSilentLogContext} from '../../../../shared/src/logging-test-utils.ts';
 import type {ZeroEvent} from '../../../../zero-events/src/index.ts';
 import type {Database} from '../../../../zqlite/src/db.ts';
+import {StatementRunner} from '../../db/statements.ts';
 import {initEventSinkForTesting} from '../../observability/events.ts';
 import {DbFile, expectTables, initDB} from '../../test/lite.ts';
 import type {Source} from '../../types/streams.ts';
@@ -33,6 +34,7 @@ import {IncrementalSyncer} from './incremental-sync.ts';
 import {ReplicationStatusPublisher} from './replication-status.ts';
 import {
   createReplicationStateTables,
+  getReplicationState,
   initReplicationState,
 } from './schema/replication-state.ts';
 import {SQLiteChangeLogObserver} from './sqlite-change-log-observability.ts';
@@ -92,6 +94,7 @@ describe('replicator/incremental-sync', () => {
       {subscribe: subscribeFn.mockResolvedValue(downstream)},
       worker,
       'serving',
+      false,
       ReplicationStatusPublisher.forReplicaFile(dbFile.path),
       undefined,
     );
@@ -106,6 +109,73 @@ describe('replicator/incremental-sync', () => {
     await worker?.stop();
     mainDb?.close();
     dbFile?.delete();
+  });
+
+  test('a commit is durable before it is acked', async () => {
+    const issues = new ReplicationMessages({issues: ['issueID']});
+
+    initReplicationState(mainDb, ['zero_data'], '02', {}, false);
+    initDB(
+      mainDb,
+      `
+    CREATE TABLE issues(
+      issueID INTEGER,
+      _0_version TEXT,
+      PRIMARY KEY(issueID)
+    );
+      `,
+    );
+
+    // The change-streamer reads an ACK as proof that the commit is on disk:
+    // the SQLite catchup barrier waits on it, and #purgeOldChanges deletes on
+    // the strength of it. Sample the replica at the moment the ACK fires --
+    // it must never be behind the commit being acked. Batching commits or
+    // making the write async would break both callers here.
+    const replica = new StatementRunner(mainDb);
+    const acked: {watermark: string; stateVersion: string}[] = [];
+    downstream = new Subscription<SerializedDownstream, Downstream>(
+      {
+        consumed: message => {
+          if (message[0] === 'commit') {
+            acked.push({
+              watermark: message[2].watermark,
+              stateVersion: getReplicationState(replica).stateVersion,
+            });
+          }
+        },
+      },
+      data => ({data, json: BigIntJSON.stringify(data)}),
+    );
+    subscribeFn.mockResolvedValue(downstream);
+
+    syncing = syncer.run();
+    const notifications = syncer.subscribe();
+    const versionReady = notifications[Symbol.asyncIterator]();
+    await versionReady.next(); // Get the initial nextStateVersion.
+
+    for (const change of [
+      ['status', {tag: 'status'}],
+      ['begin', issues.begin(), {commitWatermark: '06'}],
+      ['data', issues.insert('issues', {issueID: 123})],
+      ['commit', issues.commit(), {watermark: '06'}],
+
+      ['begin', issues.begin(), {commitWatermark: '08'}],
+      ['data', issues.insert('issues', {issueID: 456})],
+      ['commit', issues.commit(), {watermark: '08'}],
+    ] satisfies Downstream[]) {
+      downstream.push(change);
+      if (change[0] === 'commit') {
+        await Promise.race([versionReady.next(), syncing]);
+      }
+    }
+
+    // The ACK of a commit fires when the consumer moves past it, which is one
+    // message later, so wait for both rather than assuming they have landed.
+    await vi.waitFor(() => expect(acked).toHaveLength(2));
+    expect(acked).toEqual([
+      {watermark: '06', stateVersion: '06'},
+      {watermark: '08', stateVersion: '08'},
+    ]);
   });
 
   test('replicates transactions', async () => {
@@ -147,6 +217,7 @@ describe('replicator/incremental-sync', () => {
       replicaVersion: '02',
       watermark: '02',
       initial: true,
+      logsChangeStream: false,
     });
 
     const firstBegin = [
@@ -439,6 +510,7 @@ describe('replicator/incremental-sync', () => {
       replicaVersion: '09',
       watermark: '09',
       initial: true,
+      logsChangeStream: false,
     });
 
     for (const change of [
@@ -616,6 +688,7 @@ describe('replicator/incremental-sync', () => {
       replicaVersion: '09',
       watermark: '09',
       initial: true,
+      logsChangeStream: false,
     });
 
     const next = versionReady.next();
@@ -757,6 +830,7 @@ describe('replicator/incremental-sync', () => {
       },
       worker,
       'serving',
+      false,
       ReplicationStatusPublisher.forReplicaFile(dbFile.path),
       undefined,
     );
@@ -788,6 +862,7 @@ describe('replicator/incremental-sync', () => {
       },
       worker,
       'serving',
+      false,
       ReplicationStatusPublisher.forReplicaFile(dbFile.path),
       undefined,
     );
@@ -838,6 +913,7 @@ describe('replicator/incremental-sync', () => {
       {subscribe: subscribeFn},
       worker,
       'serving',
+      true,
       ReplicationStatusPublisher.forReplicaFile(dbFile.path),
       undefined,
     );
@@ -894,6 +970,7 @@ describe('replicator/incremental-sync', () => {
       {subscribe: subscribeFn.mockResolvedValue(downstream)},
       worker,
       'serving',
+      true,
       ReplicationStatusPublisher.forReplicaFile(dbFile.path),
       observer,
     );

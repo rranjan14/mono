@@ -17,15 +17,20 @@ import type {PostgresDB} from '../../types/pg.ts';
 import type {Source} from '../../types/streams.ts';
 import {Subscription, type Result} from '../../types/subscription.ts';
 import type {ChangeSource} from '../change-source/change-source.ts';
-import {type ChangeStreamMessage} from '../change-source/protocol/current/downstream.ts';
+import type {
+  ChangeStreamData,
+  ChangeStreamMessage,
+} from '../change-source/protocol/current/downstream.ts';
 import type {UpstreamStatusMessage} from '../change-source/protocol/current/status.ts';
 import {exitAfter} from '../life-cycle.ts';
+import {ChangeLogStreamWriter} from '../replicator/change-log-stream-writer.ts';
 import {IncrementalSyncer} from '../replicator/incremental-sync.ts';
 import {ReplicationStatusPublisher} from '../replicator/replication-status.ts';
 import {
   getSubscriptionState,
   initReplicationState,
   type SubscriptionState,
+  updateReplicationWatermark,
 } from '../replicator/schema/replication-state.ts';
 import {
   getSQLiteChangeLogInfo,
@@ -33,6 +38,7 @@ import {
 } from '../replicator/sqlite-change-log-observability.ts';
 import {ReplicationMessages} from '../replicator/test-utils.ts';
 import {ThreadWriteWorkerClient} from '../replicator/write-worker-client.ts';
+import {serializeChangeStreamData} from './change-log-codec.ts';
 import {
   initializeStreamer,
   type TuningOptions,
@@ -172,6 +178,35 @@ describe('change-streamer/service', () => {
 
   const messages = new ReplicationMessages({foo: 'id'});
 
+  function appendSQLiteTransaction(
+    replica: Database,
+    watermark: string,
+    data: readonly ChangeStreamData[],
+  ): void {
+    const runner = new StatementRunner(replica);
+    const writer = new ChangeLogStreamWriter(replica);
+    const begin: ChangeStreamData = [
+      'begin',
+      messages.begin(),
+      {commitWatermark: watermark},
+    ];
+    const commit: ChangeStreamData = ['commit', messages.commit(), {watermark}];
+
+    runner.beginImmediate();
+    try {
+      writer.begin(watermark, serializeChangeStreamData(begin));
+      for (const message of data) {
+        writer.append(serializeChangeStreamData(message), message[1].tag);
+      }
+      writer.commit(watermark, serializeChangeStreamData(commit), Date.now());
+      updateReplicationWatermark(runner, watermark);
+      runner.commit();
+    } catch (e) {
+      runner.rollback();
+      throw e;
+    }
+  }
+
   test('PG stream shadow-writes SQLite without changing PG serving or ACKs', async () => {
     const dbFile = new DbFile('sqlite-change-log-shadow-integration');
     const replica = dbFile.connect(lc);
@@ -229,6 +264,7 @@ describe('change-streamer/service', () => {
       },
       worker,
       'serving',
+      true,
       null,
       observer,
     );
@@ -242,6 +278,7 @@ describe('change-streamer/service', () => {
       watermark: REPLICA_VERSION,
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
     const live = drainToQueue(liveSub);
     expect(await nextChange(live)).toMatchObject({tag: 'status'});
@@ -291,6 +328,7 @@ describe('change-streamer/service', () => {
         watermark: REPLICA_VERSION,
         replicaVersion: REPLICA_VERSION,
         initial: true,
+        logsChangeStream: false,
       });
       const catchup = drainToQueue(catchupSub);
       expect(await nextChange(catchup)).toMatchObject({tag: 'status'});
@@ -323,6 +361,450 @@ describe('change-streamer/service', () => {
     }
   });
 
+  test('SQLite required head tracks forwarded transaction boundaries', async () => {
+    await streamer.stop();
+    await streamerDone;
+
+    const catchupReplicaFile = new DbFile('sqlite-catchup-service-integration');
+    const catchupReplica = catchupReplicaFile.connect(lc);
+    catchupReplica.pragma('journal_mode = wal');
+    initReplicationState(catchupReplica, ['zero_data'], REPLICA_VERSION);
+
+    changes = Subscription.create();
+    acks = new Queue();
+    streamer = await initializeStreamer(
+      lc,
+      shard,
+      'task-id',
+      'change.streamer:12345',
+      'ws',
+      sql,
+      {
+        startStream: () =>
+          Promise.resolve({
+            initialWatermark: '02',
+            changes,
+            acks: {push: status => acks.enqueue(status)},
+          }),
+        startLagReporter: () => Promise.resolve({nextSendTimeMs: 123}),
+        stop: () => Promise.resolve(),
+      },
+      ReplicationStatusPublisher.forTesting(),
+      replicaConfig,
+      null,
+      true,
+      {
+        ...opts,
+        sqliteCatchup: {
+          replicaFile: catchupReplicaFile.path,
+          readBatchRows: 2,
+          barrierTimeoutMs: 1_000,
+          // Nothing here acks the change log, so the barrier relies on its
+          // backstop poll. Keep it short rather than waiting out the default.
+          barrierPollIntervalMs: 10,
+          shouldUse: ctx => ctx.id !== 'live-observer',
+        },
+      },
+      setTimeoutFn as unknown as typeof setTimeout,
+    );
+    streamerDone = streamer.run();
+
+    try {
+      const liveSub = await streamer.subscribe({
+        protocolVersion: PROTOCOL_VERSION,
+        taskID: 'live-task',
+        id: 'live-observer',
+        mode: 'serving',
+        watermark: REPLICA_VERSION,
+        replicaVersion: REPLICA_VERSION,
+        initial: true,
+        logsChangeStream: false,
+      });
+      const live = drainToQueue(liveSub);
+      expect(await nextChange(live)).toMatchObject({tag: 'status'});
+
+      const insert04: ChangeStreamData = [
+        'data',
+        messages.insert('foo', {id: 'committed'}),
+      ];
+      changes.push(['begin', messages.begin(), {commitWatermark: '04'}]);
+      changes.push(insert04);
+      expect(await nextChange(live)).toMatchObject({tag: 'begin'});
+      expect(await nextChange(live)).toMatchObject({
+        tag: 'insert',
+        new: {id: 'committed'},
+      });
+
+      const commitSub = await streamer.subscribe({
+        protocolVersion: PROTOCOL_VERSION,
+        taskID: 'commit-task',
+        id: 'commit-catchup',
+        mode: 'serving',
+        watermark: REPLICA_VERSION,
+        replicaVersion: REPLICA_VERSION,
+        initial: true,
+        logsChangeStream: false,
+      });
+      const committed = drainToQueue(commitSub);
+
+      changes.push(['commit', messages.commit(), {watermark: '04'}]);
+      expect(await nextChange(live)).toMatchObject({tag: 'commit'});
+      appendSQLiteTransaction(catchupReplica, '04', [insert04]);
+
+      expect(await nextChange(committed)).toMatchObject({tag: 'status'});
+      expect(await nextChange(committed)).toMatchObject({tag: 'begin'});
+      expect(await nextChange(committed)).toMatchObject({
+        tag: 'insert',
+        new: {id: 'committed'},
+      });
+      expect(await nextChange(committed)).toMatchObject({tag: 'commit'});
+
+      changes.push(['begin', messages.begin(), {commitWatermark: '06'}]);
+      changes.push(['data', messages.insert('foo', {id: 'rolled-back'})]);
+      expect(await nextChange(live)).toMatchObject({tag: 'begin'});
+      expect(await nextChange(live)).toMatchObject({
+        tag: 'insert',
+        new: {id: 'rolled-back'},
+      });
+
+      const rollbackSub = await streamer.subscribe({
+        protocolVersion: PROTOCOL_VERSION,
+        taskID: 'rollback-task',
+        id: 'rollback-catchup',
+        mode: 'serving',
+        watermark: '04',
+        replicaVersion: REPLICA_VERSION,
+        initial: true,
+        logsChangeStream: false,
+      });
+      const rolledBack = drainToQueue(rollbackSub);
+
+      changes.push(['rollback', messages.rollback()]);
+      expect(await nextChange(live)).toMatchObject({tag: 'rollback'});
+      expect(await nextChange(rolledBack)).toMatchObject({tag: 'status'});
+
+      const insert08: ChangeStreamData = [
+        'data',
+        messages.insert('foo', {id: 'after-rollback'}),
+      ];
+      changes.push(['begin', messages.begin(), {commitWatermark: '08'}]);
+      changes.push(insert08);
+      changes.push(['commit', messages.commit(), {watermark: '08'}]);
+      expect(await nextChange(rolledBack)).toMatchObject({tag: 'begin'});
+      expect(await nextChange(rolledBack)).toMatchObject({
+        tag: 'insert',
+        new: {id: 'after-rollback'},
+      });
+      expect(await nextChange(rolledBack)).toMatchObject({tag: 'commit'});
+      expect(await nextChange(live)).toMatchObject({tag: 'begin'});
+      expect(await nextChange(live)).toMatchObject({
+        tag: 'insert',
+        new: {id: 'after-rollback'},
+      });
+      expect(await nextChange(live)).toMatchObject({tag: 'commit'});
+      appendSQLiteTransaction(catchupReplica, '08', [insert08]);
+
+      changes.push(['begin', messages.begin(), {commitWatermark: '0a'}]);
+      changes.push(['data', messages.insert('foo', {id: 'interrupted'})]);
+      expect(await nextChange(live)).toMatchObject({tag: 'begin'});
+      expect(await nextChange(live)).toMatchObject({
+        tag: 'insert',
+        new: {id: 'interrupted'},
+      });
+
+      const interruptedSub = await streamer.subscribe({
+        protocolVersion: PROTOCOL_VERSION,
+        taskID: 'interrupted-task',
+        id: 'interrupted-catchup',
+        mode: 'serving',
+        watermark: '08',
+        replicaVersion: REPLICA_VERSION,
+        initial: true,
+        logsChangeStream: false,
+      });
+      const interrupted = drainToQueue(interruptedSub);
+
+      changes.end();
+      expect(await nextChange(live)).toMatchObject({tag: 'rollback'});
+      expect(await nextChange(interrupted)).toMatchObject({tag: 'status'});
+      await verifyNoMoreChanges(interrupted);
+
+      liveSub.cancel();
+      commitSub.cancel();
+      rollbackSub.cancel();
+      interruptedSub.cancel();
+    } finally {
+      await streamer.stop();
+      catchupReplica.close();
+      catchupReplicaFile.delete();
+    }
+  });
+
+  test('the change-log writer ACK releases the SQLite barrier', async () => {
+    await streamer.stop();
+    await streamerDone;
+
+    const catchupReplicaFile = new DbFile('sqlite-catchup-ack-integration');
+    const catchupReplica = catchupReplicaFile.connect(lc);
+    catchupReplica.pragma('journal_mode = wal');
+    initReplicationState(catchupReplica, ['zero_data'], REPLICA_VERSION);
+
+    changes = Subscription.create();
+    acks = new Queue();
+    streamer = await initializeStreamer(
+      lc,
+      shard,
+      'task-id',
+      'change.streamer:12345',
+      'ws',
+      sql,
+      {
+        startStream: () =>
+          Promise.resolve({
+            initialWatermark: '02',
+            changes,
+            acks: {push: status => acks.enqueue(status)},
+          }),
+        startLagReporter: () => Promise.resolve({nextSendTimeMs: 123}),
+        stop: () => Promise.resolve(),
+      },
+      ReplicationStatusPublisher.forTesting(),
+      replicaConfig,
+      null,
+      true,
+      {
+        ...opts,
+        sqliteCatchup: {
+          replicaFile: catchupReplicaFile.path,
+          readBatchRows: 2,
+          barrierTimeoutMs: 60_000,
+          // Far beyond the test timeout, so only the writer's ACK can release
+          // the barrier. The change log itself is never polled for the head.
+          barrierPollIntervalMs: 60_000,
+          shouldUse: ctx => !ctx.logsChangeStream,
+        },
+      },
+      setTimeoutFn as unknown as typeof setTimeout,
+    );
+    streamerDone = streamer.run();
+
+    try {
+      // Stands in for the replicator that writes the SQLite change log. Like
+      // the real one, it applies a transaction to the replica before its
+      // consumption is acked, which is what makes the ACK mean "durable".
+      const writerSub = await streamer.subscribe({
+        protocolVersion: PROTOCOL_VERSION,
+        taskID: 'task-id',
+        id: 'change-log-writer',
+        mode: 'backup',
+        watermark: REPLICA_VERSION,
+        replicaVersion: REPLICA_VERSION,
+        initial: true,
+        logsChangeStream: true,
+      });
+      const applyTransactions = resolver<void>();
+      const received = new Queue<string>();
+      const applied = new Queue<string>();
+      const writing = (async () => {
+        const buffered: ChangeStreamData[] = [];
+        for await (const msg of writerSub) {
+          const down = BigIntJSON.parse(msg) as Downstream;
+          if (down[0] === 'data') {
+            buffered.push(down as ChangeStreamData);
+          } else if (down[0] === 'commit') {
+            const {watermark} = down[2];
+            received.enqueue(watermark);
+            await applyTransactions.promise;
+            appendSQLiteTransaction(
+              catchupReplica,
+              watermark,
+              buffered.splice(0),
+            );
+            applied.enqueue(watermark);
+          }
+        }
+      })();
+
+      changes.push(['begin', messages.begin(), {commitWatermark: '04'}]);
+      changes.push(['data', messages.insert('foo', {id: 'acked'})]);
+      changes.push(['commit', messages.commit(), {watermark: '04'}]);
+      // The commit reached the writer, so it is also the forwarded head that
+      // the next subscriber will have to wait for.
+      expect(await received.dequeue()).toBe('04');
+
+      // The writer has the transaction but has not applied it, so the replica
+      // is behind the head this subscriber requires.
+      const catchupSub = await streamer.subscribe({
+        protocolVersion: PROTOCOL_VERSION,
+        taskID: 'catchup-task',
+        id: 'sqlite-catchup',
+        mode: 'serving',
+        watermark: REPLICA_VERSION,
+        replicaVersion: REPLICA_VERSION,
+        initial: true,
+        logsChangeStream: false,
+      });
+      const caught = drainToQueue(catchupSub);
+      // The barrier holds the subscription: not even the status message is
+      // delivered until the required head is readable.
+      await sleep(50);
+      expect(caught.size()).toBe(0);
+
+      applyTransactions.resolve();
+      expect(await applied.dequeue()).toBe('04');
+
+      // Released by the writer's ACK rather than by a poll.
+      expect(await nextChange(caught)).toMatchObject({tag: 'status'});
+      expect(await nextChange(caught)).toMatchObject({tag: 'begin'});
+      expect(await nextChange(caught)).toMatchObject({
+        tag: 'insert',
+        new: {id: 'acked'},
+      });
+      expect(await nextChange(caught)).toMatchObject({tag: 'commit'});
+
+      catchupSub.cancel();
+      writerSub.cancel();
+      await writing;
+    } finally {
+      await streamer.stop();
+      catchupReplica.close();
+      catchupReplicaFile.delete();
+    }
+  });
+
+  test('backup subscribers and change-log writers cannot select SQLite catchup', async () => {
+    await streamer.stop();
+    await streamerDone;
+
+    const catchupReplicaFile = new DbFile('sqlite-catchup-writer-integration');
+    const catchupReplica = catchupReplicaFile.connect(lc);
+    catchupReplica.pragma('journal_mode = wal');
+    initReplicationState(catchupReplica, ['zero_data'], REPLICA_VERSION);
+
+    changes = Subscription.create();
+    acks = new Queue();
+    const shouldUse = vi.fn(() => true);
+    streamer = await initializeStreamer(
+      lc,
+      shard,
+      'task-id',
+      'change.streamer:12345',
+      'ws',
+      sql,
+      {
+        startStream: () =>
+          Promise.resolve({
+            initialWatermark: '02',
+            changes,
+            acks: {push: status => acks.enqueue(status)},
+          }),
+        startLagReporter: () => Promise.resolve({nextSendTimeMs: 123}),
+        stop: () => Promise.resolve(),
+      },
+      ReplicationStatusPublisher.forTesting(),
+      replicaConfig,
+      null,
+      true,
+      {
+        ...opts,
+        sqliteCatchup: {
+          replicaFile: catchupReplicaFile.path,
+          readBatchRows: 2,
+          barrierTimeoutMs: 60_000,
+          barrierPollIntervalMs: 60_000,
+          // Deliberately attempts to select every subscriber. Eligibility
+          // checks must run first and cannot be overridden by this selector.
+          shouldUse,
+        },
+      },
+      setTimeoutFn as unknown as typeof setTimeout,
+    );
+    streamerDone = streamer.run();
+
+    try {
+      const observerSub = await streamer.subscribe({
+        protocolVersion: PROTOCOL_VERSION,
+        taskID: 'observer-task',
+        id: 'observer',
+        mode: 'serving',
+        watermark: REPLICA_VERSION,
+        replicaVersion: REPLICA_VERSION,
+        initial: true,
+        logsChangeStream: false,
+      });
+      const observed = drainToQueue(observerSub);
+      expect(await nextChange(observed)).toMatchObject({tag: 'status'});
+
+      changes.push(['begin', messages.begin(), {commitWatermark: '04'}]);
+      changes.push(['data', messages.insert('foo', {id: 'forwarded'})]);
+      changes.push(['commit', messages.commit(), {watermark: '04'}]);
+      // Establishes a forwarded head, which is what the writer would then be
+      // made to wait for.
+      expect(await nextChange(observed)).toMatchObject({tag: 'begin'});
+
+      shouldUse.mockClear();
+      const backupSub = await streamer.subscribe({
+        protocolVersion: PROTOCOL_VERSION,
+        taskID: 'backup-task',
+        id: 'backup-reader',
+        mode: 'backup',
+        watermark: REPLICA_VERSION,
+        replicaVersion: REPLICA_VERSION,
+        initial: true,
+        logsChangeStream: false,
+      });
+      expect(shouldUse).not.toHaveBeenCalled();
+      const backed = drainToQueue(backupSub);
+
+      // Backup subscribers retain the PG catchup/recovery policy.
+      expect(await nextChange(backed)).toMatchObject({tag: 'status'});
+      expect(await nextChange(backed)).toMatchObject({tag: 'begin'});
+      expect(await nextChange(backed)).toMatchObject({
+        tag: 'insert',
+        new: {id: 'forwarded'},
+      });
+      expect(await nextChange(backed)).toMatchObject({tag: 'commit'});
+
+      shouldUse.mockClear();
+      const writerSub = await streamer.subscribe({
+        protocolVersion: PROTOCOL_VERSION,
+        taskID: 'task-id',
+        id: 'change-log-writer',
+        // A single-node canonical writer has serving mode, so the independent
+        // logsChangeStream guard remains necessary.
+        mode: 'serving',
+        watermark: REPLICA_VERSION,
+        replicaVersion: REPLICA_VERSION,
+        initial: true,
+        logsChangeStream: true,
+      });
+      expect(shouldUse).not.toHaveBeenCalled();
+      const written = drainToQueue(writerSub);
+
+      // Served from PG instead of waiting on itself.
+      expect(await nextChange(written)).toMatchObject({tag: 'status'});
+      expect(await nextChange(written)).toMatchObject({tag: 'begin'});
+      expect(await nextChange(written)).toMatchObject({
+        tag: 'insert',
+        new: {id: 'forwarded'},
+      });
+      expect(await nextChange(written)).toMatchObject({tag: 'commit'});
+      expect(logSink.messages).toContainEqual([
+        'warn',
+        expect.anything(),
+        [expect.stringContaining('it would wait on its own ACK')],
+      ]);
+
+      observerSub.cancel();
+      backupSub.cancel();
+      writerSub.cancel();
+    } finally {
+      await streamer.stop();
+      catchupReplica.close();
+      catchupReplicaFile.delete();
+    }
+  });
+
   test('get empty changelog state', async () => {
     expect(await streamer.getChangeLogState()).toEqual({
       minWatermark: '01',
@@ -339,6 +821,7 @@ describe('change-streamer/service', () => {
       watermark: '01',
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
     const downstream = drainToQueue(sub);
 
@@ -466,6 +949,7 @@ describe('change-streamer/service', () => {
       watermark: '01',
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
 
     changes.push(['status', {ack: true}, {watermark: '0a'}]);
@@ -584,6 +1068,7 @@ describe('change-streamer/service', () => {
       watermark: '01',
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
 
     // Process more upstream changes.
@@ -682,6 +1167,7 @@ describe('change-streamer/service', () => {
       watermark: '0b',
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
 
     // Process more upstream changes.
@@ -793,6 +1279,7 @@ describe('change-streamer/service', () => {
       watermark: '01',
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
     const downstream = drainToQueue(sub);
 
@@ -897,6 +1384,7 @@ describe('change-streamer/service', () => {
       watermark: '01',
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
     const catchup = drainToQueue(catchupSub);
     expect(await nextChange(catchup)).toMatchObject({tag: 'status'});
@@ -948,6 +1436,7 @@ describe('change-streamer/service', () => {
         watermark: '04',
         replicaVersion: REPLICA_VERSION,
         initial: true,
+        logsChangeStream: false,
       }),
     );
     expect(await nextChange(sub04)).toMatchObject({tag: 'status'});
@@ -961,6 +1450,7 @@ describe('change-streamer/service', () => {
         watermark: '08',
         replicaVersion: REPLICA_VERSION,
         initial: true,
+        logsChangeStream: false,
       }),
     );
     expect(await nextChange(sub08)).toMatchObject({tag: 'status'});
@@ -974,6 +1464,7 @@ describe('change-streamer/service', () => {
         watermark: '02',
         replicaVersion: REPLICA_VERSION,
         initial: true,
+        logsChangeStream: false,
       }),
     );
     expect(await sub02.dequeue()).toEqual([
@@ -1011,6 +1502,7 @@ describe('change-streamer/service', () => {
       watermark: '06',
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
 
     const sub2 = await streamer.subscribe({
@@ -1021,6 +1513,7 @@ describe('change-streamer/service', () => {
       watermark: '04',
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
 
     expect(
@@ -1094,6 +1587,7 @@ describe('change-streamer/service', () => {
       watermark: '04',
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
 
     const msgs = drainToQueue(sub3);
@@ -1115,6 +1609,7 @@ describe('change-streamer/service', () => {
       watermark: '06',
       replicaVersion: REPLICA_VERSION + 'foobar',
       initial: true,
+      logsChangeStream: false,
     });
 
     const msgs = drainToQueue(sub);
@@ -1487,6 +1982,7 @@ describe('change-streamer/service', () => {
       watermark: '01',
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
     const downstream = drainToQueue(sub);
 
@@ -1644,6 +2140,7 @@ describe('change-streamer/service', () => {
       watermark: '02', // Too early
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
 
     await streamerDone;
@@ -1679,6 +2176,7 @@ describe('change-streamer/service', () => {
       watermark: '01',
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
 
     const msgs = drainToQueue(sub);
@@ -1706,6 +2204,7 @@ describe('change-streamer/service', () => {
       watermark: '01',
       replicaVersion: REPLICA_VERSION,
       initial: true,
+      logsChangeStream: false,
     });
 
     const msgs = drainToQueue(sub);
