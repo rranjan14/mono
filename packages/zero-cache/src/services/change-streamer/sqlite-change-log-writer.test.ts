@@ -18,6 +18,7 @@ import {
   openChangeLogDB,
   readChangeLogHead,
   type ChangeLogIdentity,
+  type ChangeLogResumePoint,
 } from '../replicator/change-log-db.ts';
 import {ReplicationMessages} from '../replicator/test-utils.ts';
 import {serializeChangeStreamData} from './change-log-codec.ts';
@@ -486,6 +487,94 @@ describe('change-streamer/sqlite-change-log-writer', () => {
       fixture.writer.reconcile(resumeAt('04', pgCookies));
 
       expect(fixture.cookies()).toEqual(folded);
+    });
+
+    /**
+     * When Postgres is disabled, a valid log supplies its own resume point. A
+     * new or invalid log uses the replica seed.
+     *
+     * `noSeed` throws if a valid log incorrectly reads the replica seed.
+     */
+    describe('resuming from the log itself', () => {
+      const replicaSeed = resumeAt('03', pgCookies);
+      const noSeed = (): ChangeLogResumePoint => {
+        throw new Error('the seed must not be consulted');
+      };
+
+      test('a log it may keep resumes from its own head and cookies', () => {
+        using fixture = setup('change-log-writer-from-log-warm');
+
+        transaction(fixture.writer, '04', createTable);
+        const folded = fixture.cookies();
+
+        expect(fixture.writer.reconcileFromLog(noSeed)).toEqual({
+          resumeWatermark: '04',
+          cookies: folded,
+        });
+        // The log already uses its own head and cookies, so reconciliation does
+        // not change it.
+        expect(fixture.head()).toBe('04');
+        expect(fixture.cookies()).toEqual(folded);
+      });
+
+      test('a log left by another replica is seeded from the replica', () => {
+        using fixture = setup('change-log-writer-from-log-identity');
+        transaction(fixture.writer, '04', createTable);
+        fixture.writer.close();
+
+        // A reused volume can contain a log from a different replica.
+        const other = new SQLiteChangeLogWriter(fixture.lc, {
+          replicaFile: fixture.file.path,
+          identity: {...IDENTITY, replicaID: 'a-different-replica'},
+          now: () => 1_700_000_000_000,
+        });
+        try {
+          expect(other.reconcileFromLog(() => replicaSeed)).toEqual(
+            replicaSeed,
+          );
+          // The fixture uses `pgCookies` as the replica seed. This assertion
+          // makes sure that the seed supplied the cookies.
+          expect(fixture.cookies()).toEqual(pgCookies);
+          expect(fixture.head()).toBe('03');
+        } finally {
+          other.close();
+        }
+      });
+
+      test('a log created here and now is seeded from the replica', () => {
+        const sink = new TestLogSink();
+        const lc = new LogContext('debug', undefined, sink);
+        const file = new DbFile('change-log-writer-from-log-cold');
+        files.push(file);
+        const writer = new SQLiteChangeLogWriter(lc, {
+          replicaFile: file.path,
+          identity: IDENTITY,
+          now: () => 1_700_000_000_000,
+        });
+        try {
+          // A restore starts without a log, so reconciliation uses the replica
+          // seed.
+          expect(writer.reconcileFromLog(() => replicaSeed)).toEqual(
+            replicaSeed,
+          );
+        } finally {
+          writer.close();
+        }
+      });
+
+      test('a disabled writer supplies no resume point at all', () => {
+        using fixture = setup('change-log-writer-from-log-disabled');
+
+        // A write failure deletes the log and disables the writer. The caller
+        // then uses the replica resume point.
+        fixture.writer.write(
+          ['data', {tag: 'insert'} as never],
+          'not a transaction',
+        );
+        expect(fixture.disabledCount()).toBe(1);
+
+        expect(fixture.writer.reconcileFromLog(noSeed)).toBeUndefined();
+      });
     });
   });
 });

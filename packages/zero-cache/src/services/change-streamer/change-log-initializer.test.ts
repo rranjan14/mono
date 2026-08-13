@@ -17,7 +17,11 @@ import {StatementRunner} from '../../db/statements.ts';
 import {DbFile} from '../../test/lite.ts';
 import type {SchemaChange} from '../change-source/protocol/current/data.ts';
 import {readCookies} from '../replicator/change-log-cookies.ts';
-import {CHANGE_LOG_STREAM_TABLE} from '../replicator/change-log-db.ts';
+import {
+  CHANGE_LOG_STREAM_TABLE,
+  readChangeLogHead,
+  type ChangeLogResumePoint,
+} from '../replicator/change-log-db.ts';
 import {BACKFILLING_TABLE} from '../replicator/schema/backfilling.ts';
 import {
   initReplicationState,
@@ -27,6 +31,7 @@ import {
   ChangeLogInitializer,
   readReplicaInitializationParameters,
   replicaInitializationSource,
+  type ChangeLogInitializerSources,
   type InitializationParameters,
 } from './change-log-initializer.ts';
 import {
@@ -80,12 +85,33 @@ describe('change-streamer/change-log-initializer', () => {
     };
   }
 
+  /**
+   * Simulates change-log reconciliation without creating a writer. These tests
+   * write directly to the log, so the log is already consistent.
+   *
+   * Uses the Postgres point when present. Otherwise, it uses the current log
+   * head or the supplied seed.
+   */
+  function reconcileChangeLog(
+    resumeFrom: ChangeLogResumePoint | undefined,
+    seed: () => ChangeLogResumePoint,
+  ): ChangeLogResumePoint | undefined {
+    if (resumeFrom) {
+      return resumeFrom;
+    }
+    const head = readChangeLogHead(changeLog);
+    return head === null
+      ? seed()
+      : {resumeWatermark: head, cookies: readCookies(changeLog)};
+  }
+
   function initializer(
     opts: {
       initFromPgChangeLog?: boolean;
       initFromReplica?: boolean;
       pg?: () => Promise<InitializationParameters>;
       replica?: () => InitializationParameters;
+      reconcileChangeLog?: ChangeLogInitializerSources['reconcileChangeLog'];
       changeLog?: () => Database | undefined;
     } = {},
   ) {
@@ -99,15 +125,15 @@ describe('change-streamer/change-log-initializer', () => {
         pgChangeLog: opts.pg ?? (() => Promise.resolve(pgParameters())),
         replica:
           opts.replica ?? (() => readReplicaInitializationParameters(replica)),
+        reconcileChangeLog: opts.reconcileChangeLog ?? reconcileChangeLog,
         changeLog: opts.changeLog ?? (() => changeLog),
       },
     );
   }
 
-  /** The stream loop's order: initialize, reconcile, then compare. */
   async function compare(init = initializer()) {
     await init.initialize();
-    return init.compare();
+    return init.lastComparison();
   }
 
   const CREATE_FOO: SchemaChange = {
@@ -409,7 +435,7 @@ describe('change-streamer/change-log-initializer', () => {
     // Above MAX_FOLD_SCAN_ROWS. A replicator that has been stalled can leave
     // the interval arbitrarily large, and this runs between reconciliation and
     // `startStream`, so the comparison declines rather than pays.
-    padTransaction(head, 100_002);
+    padTransaction(head, 10_002);
 
     expect(await compare()).toBe('inconclusive');
   });
@@ -421,7 +447,7 @@ describe('change-streamer/change-log-initializer', () => {
     // rather than declined. Pinned because the guard counts to one row *past*
     // the cap in SQL so that an unbounded interval is not walked in full, and
     // an off-by-one there would silently stop folding a legal interval.
-    padTransaction(head, 99_999);
+    padTransaction(head, 9_999);
 
     expect(await compare()).toBe('equal-after-fold');
   });
@@ -463,7 +489,7 @@ describe('change-streamer/change-log-initializer', () => {
     // Postgres is authoritative, so the parameters still come back...
     expect((await init.initialize()).lastWatermark).toBe(wm);
     // ...and there is nothing to compare them against.
-    expect(init.compare()).toBeUndefined();
+    expect(init.lastComparison()).toBeUndefined();
   });
 
   test('a replica that cannot be read *is* fatal once it is the only source', async () => {
@@ -483,13 +509,104 @@ describe('change-streamer/change-log-initializer', () => {
     const init = initializer({initFromReplica: false});
 
     expect((await init.initialize()).lastWatermark).toBe(wm);
-    expect(init.compare()).toBeUndefined();
+    expect(init.lastComparison()).toBeUndefined();
+  });
+
+  /**
+   * When Postgres is disabled, the log supplies its own head and cookies. The
+   * initializer derives the backfill requests from those cookies.
+   */
+  describe('with Postgres retired', () => {
+    const withoutPg = (
+      opts: Parameters<typeof initializer>[0] = {},
+    ): ReturnType<typeof initializer> =>
+      initializer({
+        ...opts,
+        initFromPgChangeLog: false,
+        pg: () => Promise.reject(new Error('Postgres must not be read')),
+      });
+
+    test('the log supplies the resume point, and it is the one Postgres would have', async () => {
+      await transaction([CREATE_FOO]);
+      // The replica intentionally trails the log. Its watermark is not used
+      // because this configuration does not compare two sources.
+      const head = await transaction(
+        [
+          {
+            tag: 'add-column',
+            table: {schema: 'my', name: 'foo'},
+            column: {name: 'd', spec: {pos: 3, dataType: 'text'}},
+            backfill: {fooID: 123},
+          },
+        ],
+        {toReplica: false},
+      );
+
+      const pg = pgParameters();
+      const params = await withoutPg().initialize();
+
+      expect(params.lastWatermark).toBe(head);
+      expect(params.cookies).toEqual(pg.cookies);
+      expect(params.backfillRequests).toEqual([
+        {
+          table: {
+            schema: 'my',
+            name: 'foo',
+            metadata: {rowKey: {type: 'default', columns: ['id']}},
+          },
+          columns: {a: {fooID: 987}, b: {fooID: 843}, d: {fooID: 123}},
+        },
+      ]);
+    });
+
+    test('a log that cannot be kept falls back to the replica', async () => {
+      await transaction([CREATE_FOO]);
+      const replicated = readReplicaInitializationParameters(replica);
+
+      // A recreated log starts from the supplied replica seed.
+      const params = await withoutPg({
+        reconcileChangeLog: (_, seed) => seed(),
+      }).initialize();
+
+      expect(params.lastWatermark).toBe(replicated.lastWatermark);
+      expect(params.cookies).toEqual(replicated.cookies);
+      expect(params.backfillRequests).toEqual(replicated.backfillRequests);
+    });
+
+    test('a writer that has failed soft falls back to the replica', async () => {
+      await transaction([CREATE_FOO]);
+      await transaction([], {toReplica: false});
+      const replicated = readReplicaInitializationParameters(replica);
+
+      // When the log is unavailable, initialization uses the replica resume
+      // point.
+      const params = await withoutPg({
+        reconcileChangeLog: () => undefined,
+      }).initialize();
+
+      expect(params.lastWatermark).toBe(replicated.lastWatermark);
+      expect(params.backfillRequests).toEqual(replicated.backfillRequests);
+    });
+
+    test('nothing is compared, because there is nothing to compare against', async () => {
+      await transaction([CREATE_FOO]);
+      const init = withoutPg();
+
+      await init.initialize();
+      expect(init.lastComparison()).toBeUndefined();
+    });
+
+    test('the replica is required, since it is the floor', () => {
+      expect(() => withoutPg({initFromReplica: false})).toThrow(
+        'At least one of initFromPgChangeLog or initFromReplica',
+      );
+    });
   });
 
   test('with the replica alone its parameters are the ones returned', async () => {
     await transaction([CREATE_FOO]);
-    // What the flip produces. The replica's own state version, and the requests
-    // assembled from its own tables.
+    // With Postgres disabled, the replica supplies the state version and the
+    // backfill requests.
     const init = initializer({
       initFromPgChangeLog: false,
       pg: () => Promise.reject(new Error('must not be read')),
@@ -509,16 +626,21 @@ describe('change-streamer/change-log-initializer', () => {
         columns: {a: {fooID: 987}, b: {fooID: 843}},
       },
     ]);
-    expect(init.compare()).toBeUndefined();
+    expect(init.lastComparison()).toBeUndefined();
   });
 
-  test('a comparison is consumed, so a missed initialize cannot compare stale state', async () => {
+  test('a classification does not outlive the initialize that produced it', async () => {
     await transaction([CREATE_FOO]);
     const init = initializer();
 
     await init.initialize();
-    expect(init.compare()).toBe('equal');
-    expect(init.compare()).toBeUndefined();
+    expect(init.lastComparison()).toBe('equal');
+
+    // The next initialization clears the previous result. This initializer has
+    // only one source, so it has no comparison result.
+    const withoutReplica = initializer({initFromReplica: false});
+    await withoutReplica.initialize();
+    expect(withoutReplica.lastComparison()).toBeUndefined();
   });
 
   test('a fold that throws is reported rather than raised', async () => {
@@ -533,7 +655,7 @@ describe('change-streamer/change-log-initializer', () => {
     await init.initialize();
     // Nothing acts on the comparison, so nothing about it may reach the stream
     // loop -- but it must not be silent either.
-    expect(init.compare()).toBe('error');
+    expect(init.lastComparison()).toBe('error');
   });
 
   test('at least one source is required', () => {
